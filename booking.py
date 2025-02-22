@@ -316,6 +316,102 @@ async def handle_break_removal(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text(f"❌ Error: Invalid break selection")
     finally:
         return ConversationHandler.END
+    
+# Add to your existing code
+async def admin_cancel_booking(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != ADMIN_CHAT_ID:
+        await update.message.reply_text("❌ Admin only command")
+        return
+
+    if not appointments:
+        await update.message.reply_text("No active bookings")
+        return
+
+    buttons = []
+    for user_id, booking in appointments.items():
+        start_time = datetime.fromisoformat(booking['start']).strftime("%a %d %b %H:%M")
+        end_time = datetime.fromisoformat(booking['end']).strftime("%H:%M")
+        btn_text = (f"{booking['name']} - {start_time}-{end_time} "
+                   f"({booking['contact']})")
+        buttons.append([InlineKeyboardButton(btn_text, callback_data=f"admincancel_{user_id}")])
+    
+    buttons.append([InlineKeyboardButton("Cancel All", callback_data="admincancel_all")])
+    
+    await update.message.reply_text(
+        "Active bookings:\n\n" + 
+        "\n".join([f"{i+1}. {b['name']} - {datetime.fromisoformat(b['start']).strftime('%d/%m %H:%M')}"
+                 for i, b in enumerate(appointments.values())]),
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def handle_admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    action, _, data = query.data.partition('_')
+    
+    if data == "all":
+        # Cancel all bookings
+        cancelled = []
+        for user_id, booking in list(appointments.items()):
+            # Remove reminders
+            jobs = context.job_queue.get_jobs_by_name(str(user_id))
+            for job in jobs:
+                job.schedule_removal()
+            
+            # Notify user
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"❌ Your booking on {datetime.fromisoformat(booking['start']).strftime('%d/%m')} "
+                         "has been cancelled by admin"
+                )
+            except Exception as e:
+                await query.edit_message_text(f"❌ Error notifying user: {str(e)}")
+            
+            cancelled.append(user_id)
+            del appointments[user_id]
+        
+        with open(APPOINTMENTS_FILE, 'w') as f:
+            json.dump(appointments, f)
+        
+        await query.edit_message_text(f"✅ Cancelled {len(cancelled)} bookings")
+        return ConversationHandler.END
+    
+    try:
+        user_id = int(data)
+        booking = appointments.get(user_id)
+        
+        if not booking:
+            await query.edit_message_text("❌ Booking not found")
+            return ConversationHandler.END
+        
+        # Remove reminders
+        jobs = context.job_queue.get_jobs_by_name(str(user_id))
+        for job in jobs:
+            job.schedule_removal()
+        
+        # Notify user
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"❌ Your booking on {datetime.fromisoformat(booking['start']).strftime('%d/%m %H:%M')} "
+                     "has been cancelled by admin"
+            )
+        except Exception as e:
+            await query.edit_message_text(f"❌ Error notifying user: {str(e)}")
+        
+        # Remove booking
+        del appointments[user_id]
+        with open(APPOINTMENTS_FILE, 'w') as f:
+            json.dump(appointments, f)
+        
+        await query.edit_message_text("✅ Booking cancelled successfully")
+        
+    except ValueError:
+        await query.edit_message_text("❌ Invalid booking selection")
+    
+    return ConversationHandler.END
 
 
 # Modified booking flow
@@ -386,27 +482,38 @@ def generate_slots(day):
                 break
         
         if not in_break:
+            # Calculate end time for the slot
+            slot_end = current + duration
+            # Check if slot exceeds end time
+            if slot_end.time() > end.time():
+                break
             # Check availability
             slot_taken = any(
-                app['day'] == day and 
-                datetime.fromisoformat(app['time']) == current 
+                datetime.fromisoformat(app['start']) <= current < datetime.fromisoformat(app['end'])
                 for app in appointments.values()
+                if app['day'] == day
             )
-            if not slot_taken:
-                slots.append(current)
             
-            current += duration
-    
+            if not slot_taken:
+                slots.append({
+                    'start': current,
+                    'end': slot_end
+                })
+            
+        current += duration
     return slots
-
 async def show_time_slots(update: Update, context: CallbackContext):
     day = context.user_data['day']
     slots = generate_slots(day)
     
-    keyboard = [
-        [InlineKeyboardButton(slot.strftime("%H:%M"), callback_data=slot.isoformat())]
-        for slot in slots
-    ]
+    keyboard = []
+    for slot in slots:
+        start_str = slot['start'].strftime("%H:%M")
+        end_str = slot['end'].strftime("%H:%M")
+        keyboard.append([InlineKeyboardButton(
+            f"{start_str} - {end_str}",
+            callback_data=slot['start'].isoformat()  # Store start time as identifier
+        )])
     
     await update.message.reply_text(
         f"Available slots for {day.capitalize()}:",
@@ -414,57 +521,59 @@ async def show_time_slots(update: Update, context: CallbackContext):
     )
     return CHOOSE_TIME
 
-async def choose_time(update: Update, context: CallbackContext):
+async def choose_time(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
-    time = query.data
-    context.user_data['time'] = time
-    user_id = query.from_user.id
-
-    # Save appointment
-    appointment = {
-        'day': context.user_data['day'],
-        'time': context.user_data['time'],
+    chosen_start = datetime.fromisoformat(query.data)
+    day = context.user_data['day']
+    duration = days_config[day]['duration']
+    chosen_end = chosen_start + timedelta(minutes=duration)
+    
+    # Store appointment with interval
+    user_id = update.effective_user.id
+    appointments[user_id] = {
+        'day': day,
+        'start': chosen_start.isoformat(),
+        'end': chosen_end.isoformat(),
         'name': context.user_data['name'],
         'contact': context.user_data['contact']
     }
-    appointments[user_id] = appointment
-    # with open(APPOINTMENTS_FILE, 'w') as f:
-    #     json.dump(appointments, f)
-
-    chosen_time = datetime.fromisoformat(context.user_data['time'])
-
     
-
+    # Format confirmation message with interval
+    formatted_date = chosen_start.strftime("%A, %B %d")
+    start_time = chosen_start.strftime("%H:%M")
+    end_time = chosen_end.strftime("%H:%M")
+    
     confirmation_text = (
         "✅ Appointment confirmed!\n\n"
-        f"📅 Date: {chosen_time.strftime("%A, %B %d at %I:%M %p")}\n"
+        f"📅 Date: {formatted_date}\n"
+        f"⏰ Time: {start_time} - {end_time}\n"
         f"👤 Name: {context.user_data['name']}\n"
         f"📞 Contact: {context.user_data['contact']}\n\n"
         "You'll receive a reminder 24 hours before your appointment."
     )
     
     await query.edit_message_text(text=confirmation_text)
-    # Notify admin
+    
+    # Admin notification with interval
     admin_message = (
-        f"New booking:\n"
-        f"Name: {context.user_data['name']}\n"
-        f"Contact: {context.user_data['contact']}\n"
-        f"Day: {context.user_data['day']}\n"
-        f"Time: {chosen_time.strftime("%A, %B %d at %I:%M %p")}"
+        "📌 New Booking!\n\n"
+        f"{confirmation_text}"
     )
     await context.bot.send_message(
         chat_id=ADMIN_CHAT_ID,
         text=admin_message
     )
-    # Schedule reminder
-    reminder_time = datetime.fromisoformat(context.user_data['time']) - timedelta(hours=1)
-    await context.job_queue.run_once(
+    
+    # Schedule reminder with interval
+    reminder_time = chosen_start - timedelta(days=1)
+    context.job_queue.run_once(
         send_reminder,
-        reminder_time,
-        name=str(user_id),
+        when=reminder_time,
         user_id=user_id,
-        chat_id=user_id
+        chat_id=user_id,
+        name=str(user_id)
     )
+    
     return ConversationHandler.END
 
 async def confirm_booking(update: Update, context: CallbackContext):
@@ -513,11 +622,20 @@ async def confirm_booking(update: Update, context: CallbackContext):
     return ConversationHandler.END
 
 async def send_reminder(context: CallbackContext):
-    user_id = context.job.name
-    await context.bot.send_message(
-        chat_id=user_id,
-        text="⏰ Reminder: Your booking is in 1 hour"
-    )
+    job = context.job
+    user_id = job.context
+    appointment = appointments.get(user_id)
+    
+    if appointment:
+        start = datetime.fromisoformat(appointment['start'])
+        end = datetime.fromisoformat(appointment['end'])
+        reminder_text = (
+            "⏰ Reminder: Your appointment is tomorrow!\n"
+            f"📅 Date: {start.strftime('%A, %B %d')}\n"
+            f"⏰ Time: {start.strftime('%H:%M')} - {end.strftime('%H:%M')}\n"
+            "See you soon!"
+        )
+        await context.bot.send_message(chat_id=user_id, text=reminder_text)
 
 async def cancel(update: Update, context: CallbackContext):
     await update.message.reply_text("❌ Booking cancelled", reply_markup=ReplyKeyboardRemove())
@@ -533,6 +651,8 @@ def main():
     application.add_handler(CommandHandler('cancel_booking', cancel_booking_admin))
     application.add_handler(CallbackQueryHandler(handle_toggle, pattern=r"^toggle_"))
     application.add_handler(CallbackQueryHandler(handle_admin_cancel, pattern=r"^cancel_"))
+    application.add_handler(CommandHandler('cancel_bookings', admin_cancel_booking))
+    application.add_handler(CallbackQueryHandler(handle_admin_cancel, pattern=r"^admincancel_"))
     duration_handler = ConversationHandler(
         entry_points=[CommandHandler('set_duration', set_duration)],
         states={
