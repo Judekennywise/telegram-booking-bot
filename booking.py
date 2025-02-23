@@ -1,3 +1,5 @@
+from flask import Flask
+import threading
 import os
 import json
 from dotenv import load_dotenv
@@ -22,6 +24,19 @@ logging.basicConfig(
     level=logging.INFO
 )
 #filterwarnings(action="ignore", message=r".*CallbackQueryHandler", category=PTBUserWarning)
+
+# Minimal web server for keep-alive
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running!"
+
+def run_web_server():
+    # Get PORT from environment variable if available; otherwise, default to 8080
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
+
 
 # Configuration
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -702,4 +717,8 @@ def main():
     application.run_polling()
 
 if __name__ == '__main__':
+    # Start the web server in a new thread
+    web_thread = threading.Thread(target=run_web_server)
+    web_thread.start()
     main()
+    
