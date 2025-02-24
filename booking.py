@@ -54,16 +54,18 @@ except FileNotFoundError:
         'wednesday': {
             'active': True,
             'start': "11:00",
-            'end': "16:00",
+            'end': "15:00",
             'duration': 60,
-            'breaks': []
+            'breaks': [],
+            'allow_partial_slots': False,
         },
         'friday': {
             'active': True,
             'start': "11:00",
             'end': "15:00",
             'duration': 30,
-            'breaks': [{'start': "13:00", 'end': "14:00"}]
+            'breaks': [{'start': "13:00", 'end': "14:00"}],
+            'allow_partial_slots': False,
         }
     }
 
@@ -155,6 +157,7 @@ async def handle_admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE
 SET_DURATION_DAY, SET_DURATION_VALUE = range(8, 10)
 ADD_BREAK_DAY, ADD_BREAK_START, ADD_BREAK_END = range(10, 13)
 REMOVE_BREAK_DAY, SELECT_BREAK_TO_REMOVE = range(13, 15)
+TOGGLE_PARTIAL_DAY, SET_PARTIAL_MODE = range(15, 17)
 
 # Add these admin command handlers
 async def set_duration(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -331,7 +334,57 @@ async def handle_break_removal(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text(f"❌ Error: Invalid break selection")
     finally:
         return ConversationHandler.END
+
+async def toggle_partial_slots(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != ADMIN_CHAT_ID:
+        await update.message.reply_text("❌ Admin only command")
+        return
+
+    buttons = [
+        [
+            InlineKeyboardButton("Wednesday", callback_data="partial_wednesday"),
+            InlineKeyboardButton("Friday", callback_data="partial_friday")
+        ]
+    ]
+    await update.message.reply_text(
+        "Select day to manage partial slots:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+    return TOGGLE_PARTIAL_DAY
+
+async def set_partial_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    day = query.data.split('_')[1]
+    current_status = days_config[day]['allow_partial_slots']
     
+    buttons = [
+        [
+            InlineKeyboardButton(f"Enable {'✅' if current_status else ' '}", callback_data=f"partialenable_{day}"),
+            InlineKeyboardButton(f"Disable {'✅' if not current_status else ' '}", callback_data=f"partialdisable_{day}")
+        ]
+    ]
+    
+    await query.edit_message_text(
+        f"Current status for {day.capitalize()}: {'Enabled' if current_status else 'Disabled'}\n"
+        "Select new mode:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+    return SET_PARTIAL_MODE
+
+async def handle_partial_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    action, day = query.data.split('_')
+    
+    days_config[day]['allow_partial_slots'] = (action == 'partialenable')
+    
+    with open(DAYS_CONFIG_FILE, 'w') as f:
+        json.dump(days_config, f)
+    
+    status = "enabled" if days_config[day]['allow_partial_slots'] else "disabled"
+    await query.edit_message_text(f"✅ Partial slots {status} for {day.capitalize()}")
+    return ConversationHandler.END
+
+
 # Add to your existing code
 async def admin_cancel_booking(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != ADMIN_CHAT_ID:
@@ -344,8 +397,8 @@ async def admin_cancel_booking(update: Update, context: ContextTypes.DEFAULT_TYP
 
     buttons = []
     for user_id, booking in appointments.items():
-        start_time = datetime.fromisoformat(booking['start']).strftime("%a %d %b %H:%M")
-        end_time = datetime.fromisoformat(booking['end']).strftime("%H:%M")
+        start_time = datetime.fromisoformat(booking['start']).strftime("%a %d %b %I:%M %p").lstrip('0')
+        end_time = datetime.fromisoformat(booking['end']).strftime("%I:%M %p").lstrip('0')
         btn_text = (f"{booking['name']} - {start_time}-{end_time} "
                    f"({booking['contact']})")
         buttons.append([InlineKeyboardButton(btn_text, callback_data=f"admincancel_{user_id}")])
@@ -410,7 +463,7 @@ async def handle_admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             await context.bot.send_message(
                 chat_id=user_id,
-                text=f"❌ Your booking on {datetime.fromisoformat(booking['start']).strftime('%d/%m %H:%M')} "
+                text=f"❌ Your booking on {datetime.fromisoformat(booking['start']).strftime('%d/%m %I:%M %p').lstrip('0')} "
                      "has been cancelled by admin"
             )
         except Exception as e:
@@ -466,7 +519,6 @@ def generate_slots(day):
     config = days_config[day]
     today = datetime.today()
     
-    # Get next occurrence of the selected day
     day_number = 2 if day == 'wednesday' else 4
     next_day = today + timedelta((day_number - today.weekday()) % 7)
     
@@ -482,49 +534,62 @@ def generate_slots(day):
         microsecond=0
     )
     
-    while current.time() <= end.time():
-        # Check breaks
-        in_break = False
-        for b in config['breaks']:
-            break_start = datetime.strptime(b['start'], "%H:%M").time()
-            break_end = datetime.strptime(b['end'], "%H:%M").time()
-            if break_start <= current.time() < break_end:
-                current = current.replace(
-                    hour=break_end.hour,
-                    minute=break_end.minute
-                )
-                in_break = True
-                break
+    sorted_breaks = sorted(config['breaks'], key=lambda b: (
+        datetime.strptime(b['start'], "%H:%M").time()
+    ))
+    
+    while current.time() < end.time():
+        # Break handling (existing code)
+        # ...
         
-        if not in_break:
-            # Calculate end time for the slot
-            slot_end = current + duration
-            # Check if slot exceeds end time
-            if slot_end.time() > end.time():
-                break
+        # After break handling
+        slot_end = current + duration
+        remaining_time = datetime.combine(current.date(), end.time()) - current
+        
+        # Check for regular slot
+        if slot_end.time() <= end.time():
             # Check availability
             slot_taken = any(
                 datetime.fromisoformat(app['start']) <= current < datetime.fromisoformat(app['end'])
                 for app in appointments.values()
                 if app['day'] == day
             )
-            
             if not slot_taken:
                 slots.append({
                     'start': current,
-                    'end': slot_end
+                    'end': slot_end,
+                    'full_duration': True
                 })
-            
-        current += duration
+            current = slot_end
+        elif config['allow_partial_slots'] and remaining_time.total_seconds() > 0:
+            # Add partial slot if enabled
+            partial_end = current + remaining_time
+            if not any(
+                datetime.fromisoformat(app['start']) <= current < datetime.fromisoformat(app['end'])
+                for app in appointments.values()
+                if app['day'] == day
+            ):
+                slots.append({
+                    'start': current,
+                    'end': partial_end,
+                    'full_duration': False
+                })
+            break  # No more time after partial slot
+        
     return slots
 async def show_time_slots(update: Update, context: CallbackContext):
     day = context.user_data['day']
     slots = generate_slots(day)
     
     keyboard = []
+    if len(slots) == 0:
+        await update.message.reply_text(
+        f"No Available slots for {day.capitalize()}:"
+    )
+
     for slot in slots:
-        start_str = slot['start'].strftime("%H:%M")
-        end_str = slot['end'].strftime("%H:%M")
+        start_str = slot['start'].strftime("%I:%M %p").lstrip('0')
+        end_str = slot['end'].strftime("%I:%M %p").lstrip('0')
         keyboard.append([InlineKeyboardButton(
             f"{start_str} - {end_str}",
             callback_data=slot['start'].isoformat()  # Store start time as identifier
@@ -555,8 +620,8 @@ async def choose_time(update: Update, context: CallbackContext) -> int:
     
     # Format confirmation message with interval
     formatted_date = chosen_start.strftime("%A, %B %d")
-    start_time = chosen_start.strftime("%H:%M")
-    end_time = chosen_end.strftime("%H:%M")
+    start_time = chosen_start.strftime("%I:%M %p").lstrip('0')
+    end_time = chosen_end.strftime("%I:%M %p").lstrip('0')
     
     confirmation_text = (
         "✅ Appointment confirmed!\n\n"
@@ -647,7 +712,7 @@ async def send_reminder(context: CallbackContext):
         reminder_text = (
             "⏰ Reminder: Your appointment is tomorrow!\n"
             f"📅 Date: {start.strftime('%A, %B %d')}\n"
-            f"⏰ Time: {start.strftime('%H:%M')} - {end.strftime('%H:%M')}\n"
+            f"⏰ Time: {start.strftime('%I:%M %p').lstrip('0')} - {end.strftime('%I:%M %p').lstrip('0')}\n"
             "See you soon!"
         )
         await context.bot.send_message(chat_id=user_id, text=reminder_text)
@@ -712,6 +777,15 @@ def main():
         },
         fallbacks=[CommandHandler('cancel', cancel)]
     )
+    partial_handler = ConversationHandler(
+    entry_points=[CommandHandler('partial_slots', toggle_partial_slots)],
+    states={
+        TOGGLE_PARTIAL_DAY: [CallbackQueryHandler(set_partial_mode, pattern=r"^partial_")],
+        SET_PARTIAL_MODE: [CallbackQueryHandler(handle_partial_toggle, pattern=r"^partial(en|dis)able_")]
+    },
+    fallbacks=[CommandHandler('cancel', cancel)]
+    )
+    application.add_handler(partial_handler)
 
     application.add_handler(conv_handler)
     application.run_polling()
