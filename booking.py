@@ -538,17 +538,29 @@ def generate_slots(day):
         datetime.strptime(b['start'], "%H:%M").time()
     ))
     
-    while current.time() < end.time():
-        # Break handling (existing code)
-        # ...
+    while current.time() < end.time():  # Changed to < instead of <=
+        # Check breaks using sorted_breaks
+        in_break = False
+        for b in sorted_breaks:
+            break_start = datetime.strptime(b['start'], "%H:%M").time()
+            break_end = datetime.strptime(b['end'], "%H:%M").time()
+            
+            if break_start <= current.time() < break_end:
+                current = current.replace(
+                    hour=break_end.hour,
+                    minute=break_end.minute
+                )
+                in_break = True
+                break
         
-        # After break handling
+        if in_break:
+            continue
+        
         slot_end = current + duration
         remaining_time = datetime.combine(current.date(), end.time()) - current
         
-        # Check for regular slot
+        # Check if regular slot fits
         if slot_end.time() <= end.time():
-            # Check availability
             slot_taken = any(
                 datetime.fromisoformat(app['start']) <= current < datetime.fromisoformat(app['end'])
                 for app in appointments.values()
@@ -560,21 +572,22 @@ def generate_slots(day):
                     'end': slot_end,
                     'full_duration': True
                 })
-            current = slot_end
-        elif config['allow_partial_slots'] and remaining_time.total_seconds() > 0:
-            # Add partial slot if enabled
-            partial_end = current + remaining_time
-            if not any(
-                datetime.fromisoformat(app['start']) <= current < datetime.fromisoformat(app['end'])
-                for app in appointments.values()
-                if app['day'] == day
-            ):
-                slots.append({
-                    'start': current,
-                    'end': partial_end,
-                    'full_duration': False
-                })
-            break  # No more time after partial slot
+            current = slot_end  # Always advance time
+        else:
+            if config['allow_partial_slots'] and remaining_time.total_seconds() > 0:
+                partial_end = current + remaining_time
+                if not any(
+                    datetime.fromisoformat(app['start']) <= current < datetime.fromisoformat(app['end'])
+                    for app in appointments.values()
+                    if app['day'] == day
+                ):
+                    slots.append({
+                        'start': current,
+                        'end': partial_end,
+                        'full_duration': False
+                    })
+            # Always advance time even if not adding slot
+            current += duration  # Critical fix to prevent infinite loop
         
     return slots
 async def show_time_slots(update: Update, context: CallbackContext):
@@ -582,10 +595,6 @@ async def show_time_slots(update: Update, context: CallbackContext):
     slots = generate_slots(day)
     
     keyboard = []
-    if len(slots) == 0:
-        await update.message.reply_text(
-        f"No Available slots for {day.capitalize()}:"
-    )
 
     for slot in slots:
         start_str = slot['start'].strftime("%I:%M %p").lstrip('0')
