@@ -1,1 +1,1 @@
-{"wednesday": {"active": true, "start": "11:00", "end": "15:00", "duration": 60, "breaks": [{"start": "13:00", "end": "13:30"}], "allow_partial_slots": true}, "friday": {"active": false, "start": "11:00", "end": "15:00", "duration": 30, "breaks": [], "allow_partial_slots": false}}
+{"wednesday": {"active": true, "start": "11:00", "end": "15:00", "duration": 60, "breaks": [{"start": "13:00", "end": "13:30"}], "allow_partial_slots": false}, "friday": {"active": false, "start": "11:00", "end": "15:00", "duration": 30, "breaks": [], "allow_partial_slots": false}}
