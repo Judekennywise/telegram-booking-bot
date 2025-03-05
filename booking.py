@@ -1,4 +1,6 @@
 from flask import Flask
+from pymongo import MongoClient
+from bson.objectid import ObjectId
 import threading
 import os
 import json
@@ -37,6 +39,30 @@ def run_web_server():
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
 
+client = MongoClient(os.getenv("MONGODB_URI"))
+db = client[os.getenv("DB_NAME")]
+appointments = db.appointments
+slots_config = db.config
+
+async def get_all_appointments():
+    return appointments.find({})
+
+async def get_user_appointments(user_id):
+    return appointments.find_one({"user_id": user_id})
+
+async def get_day_appointments(day):
+    return appointments.find({
+        "day": day,
+        "start": {"$gte": datetime.now().isoformat()}
+    })
+
+async def delete_appointment(user_id):
+    result = appointments.delete_one({"user_id": user_id})
+    return result.deleted_count > 0
+
+async def create_appointment(appointment):
+    result = appointments.insert_one(appointment)
+    return result.inserted_id  # Return the unique Id
 
 # Configuration
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -70,7 +96,7 @@ except FileNotFoundError:
     }
 
 # Modified appointments structure
-appointments = {}  # Format: {user_id: {day: str, time: datetime, name: str, contact: str}}
+#appointments = {}  # Format: {user_id: {day: str, time: datetime, name: str, contact: str}}
 
 # New conversation states
 CHOOSE_DAY, GET_NAME, GET_CONTACT, CHOOSE_TIME = range(4)
@@ -390,25 +416,26 @@ async def admin_cancel_booking(update: Update, context: ContextTypes.DEFAULT_TYP
     if str(update.effective_user.id) != ADMIN_CHAT_ID:
         await update.message.reply_text("❌ Admin only command")
         return
-
-    if not appointments:
+    all_appointments = await get_all_appointments()
+    count =  appointments.count_documents({})
+    if count == 0:
         await update.message.reply_text("No active bookings")
         return
 
     buttons = []
-    for user_id, booking in appointments.items():
+    for booking in all_appointments:
         start_time = datetime.fromisoformat(booking['start']).strftime("%a %d %b %I:%M %p").lstrip('0')
         end_time = datetime.fromisoformat(booking['end']).strftime("%I:%M %p").lstrip('0')
         btn_text = (f"{booking['name']} - {start_time}-{end_time} "
                    f"({booking['contact']})")
-        buttons.append([InlineKeyboardButton(btn_text, callback_data=f"admincancel_{user_id}")])
+        buttons.append([InlineKeyboardButton(btn_text, callback_data=f"admincancel_{booking['user_id']}")])
     
     buttons.append([InlineKeyboardButton("Cancel All", callback_data="admincancel_all")])
     
     await update.message.reply_text(
         "Active bookings:\n\n" + 
         "\n".join([f"{i+1}. {b['name']} - {datetime.fromisoformat(b['start']).strftime('%d/%m %H:%M')}"
-                 for i, b in enumerate(appointments.values())]),
+                 for i, b in enumerate(all_appointments)]),
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
@@ -417,45 +444,45 @@ async def handle_admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
     
     action, _, data = query.data.partition('_')
+    all_appointments = await get_all_appointments()
     
     if data == "all":
         # Cancel all bookings
         cancelled = []
-        for user_id, booking in list(appointments.items()):
+        for booking in all_appointments:
             # Remove reminders
-            jobs = context.job_queue.get_jobs_by_name(str(user_id))
+            jobs = context.job_queue.get_jobs_by_name(str(booking['user_id']))
             for job in jobs:
                 job.schedule_removal()
             
             # Notify user
             try:
                 await context.bot.send_message(
-                    chat_id=user_id,
+                    chat_id=booking['user_id'],
                     text=f"❌ Your booking on {datetime.fromisoformat(booking['start']).strftime('%d/%m')} "
                          "has been cancelled by admin"
                 )
             except Exception as e:
                 await query.edit_message_text(f"❌ Error notifying user: {str(e)}")
             
-            cancelled.append(user_id)
-            del appointments[user_id]
+            cancelled.append(booking['user_id'])
+            result = await delete_appointment(booking['user_id'])
         
-        with open(APPOINTMENTS_FILE, 'w') as f:
-            json.dump(appointments, f)
+        
         
         await query.edit_message_text(f"✅ Cancelled {len(cancelled)} bookings")
         return ConversationHandler.END
     
     try:
         user_id = int(data)
-        booking = appointments.get(user_id)
+        booking = await get_user_appointments(user_id)
         
         if not booking:
             await query.edit_message_text("❌ Booking not found")
             return ConversationHandler.END
         
         # Remove reminders
-        jobs = context.job_queue.get_jobs_by_name(str(user_id))
+        jobs = context.job_queue.get_jobs_by_name(str(booking['user_id']))
         for job in jobs:
             job.schedule_removal()
         
@@ -470,9 +497,8 @@ async def handle_admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.edit_message_text(f"❌ Error notifying user: {str(e)}")
         
         # Remove booking
-        del appointments[user_id]
-        with open(APPOINTMENTS_FILE, 'w') as f:
-            json.dump(appointments, f)
+        result = await delete_appointment(booking['user_id'])
+        
         
         await query.edit_message_text("✅ Booking cancelled successfully")
         
@@ -534,11 +560,28 @@ def generate_slots(day):
         microsecond=0
     )
     
+    # Get all appointments for this specific date
+    start_of_day = next_day.replace(hour=0, minute=0, second=0)
+    end_of_day = next_day.replace(hour=23, minute=59, second=59)
+    
+    existing_appointments = list(appointments.find({
+        "start": {"$gte": start_of_day.isoformat()},
+        "end": {"$lte": end_of_day.isoformat()}
+    }))
+    
+    # Convert to datetime objects
+    booked_slots = []
+    for appt in existing_appointments:
+        booked_slots.append({
+            "start": datetime.fromisoformat(appt['start']),
+            "end": datetime.fromisoformat(appt['end'])
+        })
+    
     sorted_breaks = sorted(config['breaks'], key=lambda b: (
         datetime.strptime(b['start'], "%H:%M").time()
     ))
     
-    while current.time() < end.time():  # Changed to < instead of <=
+    while current.time() < end.time():
         # Check breaks using sorted_breaks
         in_break = False
         for b in sorted_breaks:
@@ -559,36 +602,35 @@ def generate_slots(day):
         slot_end = current + duration
         remaining_time = datetime.combine(current.date(), end.time()) - current
         
-        # Check if regular slot fits
+        # Check for time slot conflicts
+        slot_taken = any(
+            (slot['start'] < slot_end and slot['end'] > current)
+            for slot in booked_slots
+        )
+        
+        # Regular slot check
         if slot_end.time() <= end.time():
-            slot_taken = any(
-                datetime.fromisoformat(app['start']) <= current < datetime.fromisoformat(app['end'])
-                for app in appointments.values()
-                if app['day'] == day
-            )
             if not slot_taken:
                 slots.append({
                     'start': current,
                     'end': slot_end,
                     'full_duration': True
                 })
-            current = slot_end  # Always advance time
+            current = slot_end
         else:
             if config['allow_partial_slots'] and remaining_time.total_seconds() > 0:
                 partial_end = current + remaining_time
                 if not any(
-                    datetime.fromisoformat(app['start']) <= current < datetime.fromisoformat(app['end'])
-                    for app in appointments.values()
-                    if app['day'] == day
+                    (slot['start'] < partial_end and slot['end'] > current)
+                    for slot in booked_slots
                 ):
                     slots.append({
                         'start': current,
                         'end': partial_end,
                         'full_duration': False
                     })
-            # Always advance time even if not adding slot
-            current += duration  # Critical fix to prevent infinite loop
-        
+            current += duration
+            
     return slots
 async def show_time_slots(update: Update, context: CallbackContext):
     day = context.user_data['day']
@@ -619,13 +661,17 @@ async def choose_time(update: Update, context: CallbackContext) -> int:
     
     # Store appointment with interval
     user_id = update.effective_user.id
-    appointments[user_id] = {
-        'day': day,
-        'start': chosen_start.isoformat(),
-        'end': chosen_end.isoformat(),
-        'name': context.user_data['name'],
-        'contact': context.user_data['contact']
+    appointment = {
+        "user_id": user_id,
+        "day": day,
+        "start": chosen_start.isoformat(),
+        "end": chosen_end.isoformat(),
+        "name": context.user_data['name'],
+        "contact": context.user_data['contact'],
+        "reminder_sent": False
     }
+
+    result = appointments.insert_one(appointment)
     
     # Format confirmation message with interval
     formatted_date = chosen_start.strftime("%A, %B %d")
@@ -712,8 +758,8 @@ async def confirm_booking(update: Update, context: CallbackContext):
 
 async def send_reminder(context: CallbackContext):
     job = context.job
-    user_id = job.context
-    appointment = appointments.get(user_id)
+    user_id = job.user_id
+    appointment = get_user_appointments(user_id)
     
     if appointment:
         start = datetime.fromisoformat(appointment['start'])
