@@ -15,7 +15,8 @@ from telegram.ext import (
     MessageHandler,
     filters,
     CallbackContext,
-    ContextTypes
+    ContextTypes,
+    PicklePersistence
 )
 
 load_dotenv()
@@ -42,6 +43,7 @@ def run_web_server():
 client = MongoClient(os.getenv("MONGODB_URI"))
 db = client[os.getenv("DB_NAME")]
 appointments = db.appointments
+persistent = db.persistents
 slots_config = db.config
 
 async def get_all_appointments():
@@ -63,6 +65,13 @@ async def delete_appointment(user_id):
 async def create_appointment(appointment):
     result = appointments.insert_one(appointment)
     return result.inserted_id  # Return the unique Id
+
+async def get_user_persistent(user_id):
+    return persistent.find_one({"user_id": user_id})
+
+async def delete_persistent(user_id):
+    result = persistent.delete_one({"user_id": user_id})
+    return result.deleted_count > 0
 
 # Configuration
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -100,6 +109,7 @@ except FileNotFoundError:
 
 # New conversation states
 CHOOSE_DAY, GET_NAME, GET_CONTACT, CHOOSE_TIME = range(4)
+ADMIN_APPROVAL, REJECTION_REASON = range(4, 6)
 
 # Admin commands
 async def toggle_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -658,58 +668,117 @@ async def choose_time(update: Update, context: CallbackContext) -> int:
     day = context.user_data['day']
     duration = days_config[day]['duration']
     chosen_end = chosen_start + timedelta(minutes=duration)
-    
-    # Store appointment with interval
-    user_id = update.effective_user.id
-    appointment = {
-        "user_id": user_id,
-        "day": day,
-        "start": chosen_start.isoformat(),
-        "end": chosen_end.isoformat(),
-        "name": context.user_data['name'],
-        "contact": context.user_data['contact'],
-        "reminder_sent": False
+    appointments = {
+        'day': day,
+        'start': chosen_start.isoformat(),
+        'end': chosen_end.isoformat(),
+        'startf': chosen_start.strftime('%I:%M %p').lstrip('0'),
+        'endf': chosen_end.strftime('%I:%M %p').lstrip('0'),
+        'name': context.user_data['name'],
+        'contact': context.user_data['contact'],
+        'user_id': update.effective_user.id,
+        'reminder_sent': False
     }
 
-    result = appointments.insert_one(appointment)
+    # Store pending booking in user_data
+    context.user_data['pending_booking'] = appointments
+    result = persistent.insert_one(appointments)
     
-    # Format confirmation message with interval
-    formatted_date = chosen_start.strftime("%A, %B %d")
-    start_time = chosen_start.strftime("%I:%M %p").lstrip('0')
-    end_time = chosen_end.strftime("%I:%M %p").lstrip('0')
+    # Send to admin for approval
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Approve", callback_data=f"approve_{update.effective_user.id}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"reject_{update.effective_user.id}")
+        ]
+    ]
     
-    confirmation_text = (
-        "✅ Appointment confirmed!\n\n"
-        f"📅 Date: {formatted_date}\n"
-        f"⏰ Time: {start_time} - {end_time}\n"
-        f"👤 Name: {context.user_data['name']}\n"
-        f"📞 Contact: {context.user_data['contact']}\n\n"
-        "You'll receive a reminder 24 hours before your appointment."
-    )
-    
-    await query.edit_message_text(text=confirmation_text)
-    
-    # Admin notification with interval
-    admin_message = (
-        "📌 New Booking!\n\n"
-        f"{confirmation_text}"
-    )
     await context.bot.send_message(
         chat_id=ADMIN_CHAT_ID,
-        text=admin_message
+        text=f"New booking request:\n\n"
+             f"Name: {context.user_data['name']}\n"
+             f"Contact: {context.user_data['contact']}\n"
+             f"Day: {day.capitalize()}\n"
+             f"Time: {chosen_start.strftime('%I:%M %p').lstrip('0')} - {chosen_end.strftime('%I:%M %p').lstrip('0')}",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
     
-    # Schedule reminder with interval
-    reminder_time = chosen_start - timedelta(days=1)
-    context.job_queue.run_once(
-        send_reminder,
-        when=reminder_time,
-        user_id=user_id,
-        chat_id=user_id,
-        name=str(user_id)
-    )
-    
+    await query.edit_message_text("⌛ Your request has been sent for approval!")
     return ConversationHandler.END
+
+# Add admin approval handler
+async def handle_admin_approval(update: Update, context: CallbackContext):
+    query = update.callback_query
+    action, user_id = query.data.split('_')
+    user_id = int(user_id)
+    
+    # Get pending booking from user_data
+    user_data = await get_user_persistent(user_id=user_id)
+    print(user_data)
+    #pending_booking = user_data.get('pending_booking')
+    
+    if not user_data:
+        await query.edit_message_text("❌ Booking request not found")
+        return
+    
+    if action == 'approve':
+        # Save to database
+        appointments.insert_one({
+            'user_id': user_id,
+            'day': user_data['day'],
+            'end': user_data['end'],
+            'start': user_data['start'],
+            'name': user_data['name'],
+            'contact': user_data['contact'],
+            'status': 'confirmed'
+        })
+        
+        # Notify user
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"✅ Your booking for {user_data['day'].capitalize()} "
+                 f"at {user_data['startf']} has been confirmed!"
+        )
+        await query.edit_message_text(f"✅ Booking approved!\n\n"
+                                      f"Name: {user_data['name']}\n"
+                                      f"Contact: {user_data['contact']}\n"
+                                      f"Day: {user_data['day']}\n"
+                                      f"Time: {user_data['startf']} - {user_data['endf']}")
+        # Clear pending booking
+        await delete_persistent(user_id=user_id)
+        
+    else:
+        # Store rejection context in admin's user_data
+        context.user_data['rejecting_user'] = user_id
+    
+        
+        await query.edit_message_text("📝 Please enter the rejection reason:")
+        return REJECTION_REASON
+        
+
+async def rejection_reason(update: Update, context: CallbackContext):
+    reason = update.message.text
+    print(reason)
+    user_id = context.user_data['rejecting_user']
+    user_data = await get_user_persistent(user_id=user_id)
+    
+    # Notify user
+    await context.bot.send_message(
+            chat_id=user_id,
+            text=f"❌ Your booking request for {user_data['day'].capitalize()} "
+                 f"at {user_data['startf']} was declined.\n\n Reason: {reason}"
+        )
+    
+    # Clear pending booking
+    await delete_persistent(user_id=user_id)
+    
+    await update.message.reply_text(f"❌ Booking rejected!\n\n"
+                                      f"Name: {user_data['name']}\n"
+                                      f"Contact: {user_data['contact']}\n"
+                                      f"Day: {user_data['day']}\n"
+                                      f"Time: {user_data['startf']} - {user_data['endf']}")
+    return ConversationHandler.END
+
+
 
 async def confirm_booking(update: Update, context: CallbackContext):
     query = update.callback_query
@@ -779,6 +848,7 @@ async def cancel(update: Update, context: CallbackContext):
 
 # Modified main function
 def main():
+    # Set up persistence
     application = ApplicationBuilder().token(TOKEN).build()
 
     # Admin handlers
@@ -820,6 +890,22 @@ def main():
     )
 
     application.add_handler(remove_break_handler)
+    # Add admin approval handler
+    admin_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(handle_admin_approval, pattern=r"^(approve|reject)_")],
+        states={
+            REJECTION_REASON: [MessageHandler(
+                filters.TEXT & ~filters.COMMAND,
+                rejection_reason
+            )]
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+        per_user=True,
+        per_chat=False
+        
+    )
+    
+    application.add_handler(admin_conv)
 
     # Booking conversation handler
     conv_handler = ConversationHandler(
