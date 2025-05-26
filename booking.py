@@ -713,7 +713,6 @@ async def handle_admin_approval(update: Update, context: CallbackContext):
     
     # Get pending booking from user_data
     user_data = await get_user_persistent(user_id=user_id)
-    print(user_data)
     #pending_booking = user_data.get('pending_booking')
     
     if not user_data:
