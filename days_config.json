@@ -1,1 +1,1 @@
-{"wednesday": {"active": true, "start": "11:00", "end": "15:00", "duration": 30, "breaks": [{"start":13:00, "end": 13:30}]}, "friday": {"active": false, "start": "11:00", "end": "15:00", "duration": 30, "breaks": []}}
+{"wednesday": {"active": true, "start": "11:00", "end": "15:00", "duration": 30, "breaks": [{"start":"13:00", "end": "13:30"}]}, "friday": {"active": false, "start": "11:00", "end": "15:00", "duration": 30, "breaks": []}}
